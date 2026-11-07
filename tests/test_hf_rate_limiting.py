@@ -285,3 +285,59 @@ def test_default_backoff_config_follows_the_ci_env_var(monkeypatch: pytest.Monke
     monkeypatch.delenv("CI")
     set_backoff_config(None)
     assert get_backoff_config() == STANDARD_BACKOFF_CONFIG
+
+
+@pytest.fixture(autouse=True)
+def online_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", False)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LocalEntryNotFoundError("Outgoing traffic has been disabled"),
+        ConnectionError("Couldn't reach 'org/repo' on the Hub"),
+    ],
+)
+def test_backoff_gives_up_in_offline_mode(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", True)
+    responses: list[Exception | None] = [error]
+
+    with patch("time.sleep") as mock_sleep:
+        wrapped = hf_backoff_policy(**BACKOFF_CONFIG)(hf_call_simulated(responses))
+        with pytest.raises(type(error)):
+            wrapped("foo")
+
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Couldn't reach 'org/repo' on the Hub (OfflineModeIsEnabled)",
+        "Unable to connect to another service",
+    ],
+)
+def test_backoff_gives_up_on_non_transient_connection_error(message: str) -> None:
+    responses: list[Exception | None] = [ConnectionError(message)]
+
+    with patch("time.sleep") as mock_sleep:
+        wrapped = hf_backoff_policy(**BACKOFF_CONFIG)(hf_call_simulated(responses))
+        with pytest.raises(ConnectionError):
+            wrapped("foo")
+
+    mock_sleep.assert_not_called()
+
+
+def test_backoff_retries_on_hub_connection_error() -> None:
+    """Datasets can discard the original exception when the Hub is unreachable."""
+    error = ConnectionError("Couldn't reach 'org/repo' on the Hub (LocalEntryNotFoundError)")
+    responses: list[Exception | None] = [error, None]
+
+    with patch("time.sleep") as mock_sleep:
+        wrapped = hf_backoff_policy(**BACKOFF_CONFIG)(hf_call_simulated(responses))
+        assert wrapped("foo") == {"result": "ok"}
+
+    mock_sleep.assert_called_once()
